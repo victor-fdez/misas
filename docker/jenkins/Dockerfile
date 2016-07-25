@@ -1,49 +1,96 @@
-FROM docker:1.10.3-dind 
+#FROM docker:1.11.2
+FROM java:openjdk-8-jdk-alpine
 MAINTAINER Victor Fernandez <victor.j.fdez@gmail.com> 
 
 # Install jre 8
-RUN apk --no-cache add openjdk8-jre  &&\
+RUN apk --no-cache add git \ 
+                       openssh-client \
+                       curl \
+                       zip \
+                       unzip \ 
+                       bash \ 
+                       ttf-dejavu \
+                       xz  && \
+#                       python \
+#                       py-pip && \
     rm -rf /tmp/*
 
-# Start container
-CMD ["java","-version"]
+
 
 # Install Jenkins
+ENV JENKINS_HOME /var/jenkins_home
+ENV JENKINS_SLAVE_AGENT_PORT 50000
 
-#USER root
-#RUN apt-get update && \
-#    apt-get install -y curl xz-utils 
-#RUN curl -L -o rancher-compose.tar.xz https://github.com/rancher/rancher-compose/releases/download/v0.8.5/rancher-compose-linux-amd64-v0.8.5.tar.xz && \
-#    tar xf rancher-compose.tar.xz && cp rancher-compose-v0.8.5/rancher-compose /usr/local/bin/ && \
-#    rm -rf rancher-compose* && \
-#    rancher-compose --version
+ARG user=jenkins
+ARG group=jenkins
+ARG uid=1000
+ARG gid=1000
 
-# Setup environment
-ENV JENKINS_VERSION %%VERSION%%
-ENV JENKINS_USER jenkins
-ENV JENKINS_GROUP jenkins
-ENV JENKINS_HOME /opt/jenkins
-ENV JENKINS_VOL /var/lib/jenkins
+# Jenkins is run with user `jenkins`, uid = 1000
+# If you bind mount a volume from the host or a data container, 
+# ensure you use the same uid
+RUN addgroup -g ${gid} ${group} \
+    && adduser -h "$JENKINS_HOME" -u ${uid} -G ${group} -s /bin/bash -D ${user}
 
-# Install software
-RUN apk update &&\
-    apk upgrade &&\
-    mkdir -p $JENKINS_HOME $JENKINS_VOL/plugins $JAVA_BASE &&\
-    curl -sSL http://mirrors.jenkins-ci.org/war/${JENKINS_VERSION}/jenkins.war --output ${JENKINS_HOME}/jenkins.war &&\
-    addgroup ${JENKINS_GROUP} &&\
-    adduser -h ${JENKINS_HOME} -D -s /bin/bash -G ${JENKINS_GROUP} ${JENKINS_USER} &&\
-    chown -R ${JENKINS_USER}:${JENKINS_GROUP} ${JENKINS_HOME} ${JENKINS_VOL} &&\
-    for plugins in credentials ssh-credentials ssh-agent ssh-slaves git-client git github github-api github-oauth ghprb scm-api postbuild-task greenballs; do  curl -sSL http://updates.jenkins-ci.org/latest/${plugins}.hpi --output $JENKINS_VOL/${plugins}.hpi; done
+# Jenkins home directory is a volume, so configuration and build history 
+# can be persisted and survive image upgrades
+VOLUME /var/jenkins_home
+
+# `/usr/share/jenkins/ref/` contains all reference configuration we want 
+# to set on a fresh new installation. Use it to bundle additional plugins 
+# or config file with your custom jenkins Docker image.
+RUN mkdir -p /usr/share/jenkins/ref/init.groovy.d
+
+ENV TINI_VERSION 0.9.0
+ENV TINI_SHA fa23d1e20732501c3bb8eeeca423c89ac80ed452
+
+# Use tini as subreaper in Docker container to adopt zombie processes 
+RUN curl -fsSL https://github.com/krallin/tini/releases/download/v${TINI_VERSION}/tini-static -o /bin/tini && chmod +x /bin/tini \
+  && echo "$TINI_SHA  /bin/tini" | sha1sum -c -
+
+COPY init.groovy /usr/share/jenkins/ref/init.groovy.d/tcp-slave-agent-port.groovy
+
+ARG JENKINS_VERSION
+ENV JENKINS_VERSION ${JENKINS_VERSION:-2.7.1}
+ARG JENKINS_SHA
+ENV JENKINS_SHA ${JENKINS_SHA:-12d820574c8f586f7d441986dd53bcfe72b95453}
 
 
-# Listen for main web interface (8080/tcp) and attached slave agents (50000/tcp)
-EXPOSE 8080 50000
+# could use ADD but this one does not check Last-Modified header 
+# see https://github.com/docker/docker/issues/8331
+RUN curl -fsSL http://repo.jenkins-ci.org/public/org/jenkins-ci/main/jenkins-war/${JENKINS_VERSION}/jenkins-war-${JENKINS_VERSION}.war -o /usr/share/jenkins/jenkins.war \
+  && echo "$JENKINS_SHA  /usr/share/jenkins/jenkins.war" | sha1sum -c -
 
-# Expose volumes
-VOLUME ["${JENKINS_VOL}"]
+ENV JENKINS_UC https://updates.jenkins.io
+RUN chown -R ${user} "$JENKINS_HOME" /usr/share/jenkins/ref
 
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+# for main web interface:
+EXPOSE 8080
 
-USER ${JENKINS_USER}
+# will be used by attached slave agents:
+EXPOSE 50000
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+ENV COPY_REFERENCE_FILE_LOG $JENKINS_HOME/copy_reference_file.log
+
+COPY jenkins.sh /usr/local/bin/jenkins.sh
+ENTRYPOINT ["/bin/tini", "--", "/usr/local/bin/jenkins.sh"]
+
+# from a derived Dockerfile, can use `RUN plugins.sh active.txt` to setup /usr/share/jenkins/ref/plugins from a support bundle
+COPY plugins.sh /usr/local/bin/plugins.sh
+COPY install-plugins.sh /usr/local/bin/install-plugins.sh
+
+# Install rancher-compose
+
+RUN curl -L -o rancher-compose.tar.xz \
+    https://github.com/rancher/rancher-compose/releases/download/v0.8.5/rancher-compose-linux-amd64-v0.8.5.tar.xz && \
+    tar xf rancher-compose.tar.xz && cp rancher-compose-v0.8.5/rancher-compose /usr/local/bin/ && \
+    rm -rf rancher-compose* && \
+    rancher-compose --version
+
+# Install docker-compose, installed with pip there are issues with the
+# binary in alpine https://github.com/docker/compose/issues/3465
+
+# Use Jenkins at startup
+COPY jenkins.sh /usr/local/bin/jenkins.sh
+ENTRYPOINT ["/bin/tini", "--", "/usr/local/bin/jenkins.sh"]
+

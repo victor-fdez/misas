@@ -1,11 +1,10 @@
-credentials
 greenballs
-git
 junit
-git-client
-github-api
-github-oauth
+git
 github
+github-api
+git-client
+github-oauth
 plain-credentials
 scm-api
 ssh-credentials
